@@ -1,0 +1,29 @@
+# Every limit the AI obeys lives here. Change a number, commit, and the next run uses it.
+
+dry_run = true            # true: report what would be paid, pay nothing
+review_all_first = 20     # the first N paid orders (last 90 days) all need your approval
+
+# Outgoing check: what the AI may spend at CJ without asking (USD, CJ's currency)
+per_order_cap_usd = 15
+daily_cap_usd = 60
+low_balance_usd = 10      # email a top-up reminder below this wallet balance
+
+# Incoming check: which orders are safe to fulfil without asking
+country = "ID"            # must ship from and to this country (Indonesia's USD 100 cross-border floor)
+min_margin_pct = 15
+platform_fee_pct = 10     # TikTok Shop commission + payment fee; check your Seller Center
+hold_above_idr = 500000   # order value above this is held (also the only guard against refused COD)
+max_qty = 3               # more units than this in one order is held
+max_orders_per_buyer = 2  # more open/paid-today orders than this to one phone number is held
+usd_idr = 16500           # shortcut: fixed rate, update monthly; fetch a live rate when margins get thin
+
+# Product scout
+scout_min_stock = 50
+scout_max_cost_usd = 10
+est_shipping_usd = 1.5    # rough CJ domestic postage used when suggesting a price
+
+# Approved products: CJ variant id -> your TikTok price. Anything not listed here is held.
+# [catalog."1392053744945991680"]
+# name = "Example item"
+# price_idr = 89000
+[catalog]
