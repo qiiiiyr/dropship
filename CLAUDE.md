@@ -23,6 +23,7 @@ Scheduled runs use `/tick` (hourly) and `/daily`; the agents are in `.claude/age
 
 - Nothing is stored between runs. CJ is the record of orders, the Resend mailbox is the record of approvals. Do not add a database or state file while this runs on scheduled cloud sessions; they start on a fresh machine every time.
 - `tick.run(cj, mail, cfg)` takes the modules as arguments so tests can pass fakes. Keep `review.py` pure.
+- An approval email is signed over the order id and its cost in cents (`mail.code`): if CJ re-prices the order, the approval no longer matches and the order is held and asked about again.
 - One CJ payment per order, so the quoted amount can be checked against the reviewed amount before paying (`cj.pay`).
 - Standard library only. No new dependencies without the owner's say.
 

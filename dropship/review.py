@@ -1,25 +1,26 @@
 """The two payment checks. Pure functions: an empty list means "safe to pay"."""
 
 
-def margin_pct(order, cfg):
-    """Profit as % of what the buyer paid, or None if an item is not in the catalogue."""
-    revenue = 0
-    for item in order.get("productList") or []:
-        entry = cfg["catalog"].get(item["vid"])
-        if not entry:
-            return None
-        revenue += entry["price_idr"] * item["quantity"]
-    if not revenue:
-        return None
-    cost = float(order.get("orderAmount") or 0) * cfg["usd_idr"]
-    return (revenue * (1 - cfg["platform_fee_pct"] / 100) - cost) / revenue * 100
-
-
 def revenue_idr(order, cfg):
+    # This is the catalogue price from config.toml, not what the buyer paid: a TikTok
+    # discount is invisible here, so set price_idr to the lowest price you will sell at.
     return sum(
         cfg["catalog"].get(i["vid"], {}).get("price_idr", 0) * i["quantity"]
         for i in order.get("productList") or []
     )
+
+
+def profit_idr(order, cfg):
+    cost = float(order.get("orderAmount") or 0) * cfg["usd_idr"]
+    return revenue_idr(order, cfg) * (1 - cfg["platform_fee_pct"] / 100) - cost
+
+
+def margin_pct(order, cfg):
+    """Profit as % of the catalogue price, or None if an item is not in the catalogue."""
+    revenue = revenue_idr(order, cfg)
+    if not revenue or any(i["vid"] not in cfg["catalog"] for i in order.get("productList") or []):
+        return None
+    return profit_idr(order, cfg) / revenue * 100
 
 
 def screen(order, cfg, orders_to_buyer):

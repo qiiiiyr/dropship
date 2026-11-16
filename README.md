@@ -36,6 +36,8 @@ Set in the cloud environment (or as ordinary environment variables elsewhere):
 | `RESEND_API_KEY` | Resend key. Not needed in the Claude cloud environment, where it is saved as a network secret for `api.resend.com`. |
 | `MAIL_FROM` | Optional. Defaults to `Dropship <onboarding@resend.dev>`. |
 
+The cloud environment must allow the hosts `developers.cjdropshipping.com` and `api.resend.com` (saving the Resend key as a network secret allows the second one). Without `api.resend.com` every run stops at its first step.
+
 Check everything with `python3 -m dropship selfcheck`.
 
 ## The limits
@@ -48,7 +50,7 @@ All in [`dropship/config.toml`](dropship/config.toml). The defaults are cautious
 
 A held order sends you one email a day with two buttons. Tap one and press send on the email that opens; the next run pays it or leaves it. A rejected order stays unpaid: cancel it yourself in TikTok Seller Center, since cancellations count against your shop.
 
-Products are approved by adding them under `[catalog]` with your TikTok price. The CJ variant id is shown in the review email of the first order for that product (`unlisted item <id>`).
+Products are approved by adding them under `[catalog]` with your TikTok price. Use the lowest price you will sell at: the margin check cannot see TikTok discounts or vouchers, only this number. The CJ variant id is shown in the review email of the first order for that product (`unlisted item <id>`).
 
 ## Going live
 

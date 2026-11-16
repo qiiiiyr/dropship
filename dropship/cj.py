@@ -21,12 +21,14 @@ class Blocked(Exception):
 
 def call(method, path, params=None, body=None):
     global _last_call
+    # Get the token first: it is itself a request, and it must not sit right before this one.
+    tok = None if path.startswith("/authentication/") else token()
     time.sleep(max(0, _last_call + 1.1 - time.monotonic()))  # CJ allows 1 request/second
     _last_call = time.monotonic()
     url = BASE + path + ("?" + urllib.parse.urlencode(params, doseq=True) if params else "")
     headers = {"Content-Type": "application/json", "User-Agent": "dropship/1.0"}
-    if not path.startswith("/authentication/"):
-        headers["CJ-Access-Token"] = token()
+    if tok:
+        headers["CJ-Access-Token"] = tok
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:

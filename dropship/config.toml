@@ -23,6 +23,7 @@ scout_max_cost_usd = 10
 est_shipping_usd = 1.5    # rough CJ domestic postage used when suggesting a price
 
 # Approved products: CJ variant id -> your TikTok price. Anything not listed here is held.
+# price_idr is what the margin check assumes the buyer pays. It cannot see TikTok discounts, so use the lowest price you will sell at.
 # [catalog."1392053744945991680"]
 # name = "Example item"
 # price_idr = 89000

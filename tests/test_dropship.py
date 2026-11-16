@@ -1,14 +1,17 @@
 """Run with: python -m unittest discover -s tests"""
 import copy
+import io
+import json
 import os
 import tomllib
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
-os.environ.update(APPROVAL_SECRET="test-secret", RESEND_INBOUND="abc.resend.app", OWNER_EMAIL="owner@example.com")
+os.environ.update(CJ_API_KEY="test-key", APPROVAL_SECRET="test-secret", RESEND_INBOUND="abc.resend.app", OWNER_EMAIL="owner@example.com")
 
-from dropship import mail, review, tick  # noqa: E402
+from dropship import cj, mail, review, tick  # noqa: E402
 from dropship.cj import Blocked  # noqa: E402
 
 NOW = datetime(2026, 11, 15, 12, 0, tzinfo=timezone.utc)
@@ -39,10 +42,12 @@ class FakeCJ:
         return self.wallet
 
     def orders(self, status=None, paymentDateFrom=None, **_):
-        if paymentDateFrom:
-            found = [o for o in self.db.values() if (o.get("paymentDate") or "") >= paymentDateFrom]
-        else:
-            found = [o for o in self.db.values() if o["orderStatus"] == status]
+        # Like CJ: an omitted status plus a payment-date filter is an error, not "everything".
+        assert status or not paymentDateFrom, "payment-date filter without a status"
+        found = [
+            o for o in self.db.values()
+            if o["orderStatus"] == status and (not paymentDateFrom or (o.get("paymentDate") or "") >= paymentDateFrom)
+        ]
         return {"total": len(found), "list": found}
 
     def order(self, oid):
@@ -67,6 +72,13 @@ class FakeMail:
 
     def decisions(self):
         return self.verdicts
+
+    def verdict(self, decisions, oid, cost):
+        # a plain value approves any price; (verb, usd) approves only that price, like the real signed code
+        v = decisions.get(oid.lower())
+        if isinstance(v, tuple):
+            return v[0] if round(v[1] * 100) == round(cost * 100) else None
+        return v
 
     def ask(self, oid, cost, facts, reasons, today):
         self.asked.append(oid)
@@ -167,28 +179,143 @@ class Tick(unittest.TestCase):
         out, m = self.run_tick(FakeCJ(order(orderAmount=None)))
         self.assertEqual((out["waiting"], m.asked), (["A1"], []))
 
+    def test_approval_does_not_survive_a_re_price(self):
+        # approved at $3.00, then CJ says $14.00 (under the $15 cap, but a different price)
+        cj_ = FakeCJ(order(fromCountryCode="CN", orderAmount=14.0))
+        out, m = self.run_tick(cj_, FakeMail(a1=("approve", 3.0)))
+        self.assertEqual((cj_.pay_calls, m.asked), ([], ["A1"]))
+        out, m = self.run_tick(cj_, FakeMail(a1=("approve", 14.0)))
+        self.assertEqual(cj_.pay_calls, ["A1"])
+
+    def test_mail_outage_does_not_stop_clean_orders(self):
+        class Down(FakeMail):
+            def decisions(self):
+                raise OSError("tunnel 403")
+
+        cj_ = FakeCJ(order("A1"), order("A2", fromCountryCode="CN"))
+        out, m = self.run_tick(cj_, Down())
+        self.assertEqual(cj_.pay_calls, ["A1"])  # the clean one is paid, the held one waits
+        self.assertIn("cannot read approvals", out["errors"][0]["error"])
+
+    def test_report_counts_paid_orders_once_and_uses_explicit_statuses(self):
+        cj_ = FakeCJ(order("A1", orderStatus="UNSHIPPED", paymentDate="2026-11-15 11:00:00"),
+                     order("A2", orderStatus="SHIPPED", paymentDate="2026-11-15 09:00:00"),
+                     order("A3", orderStatus="SHIPPED", paymentDate="2026-11-14 09:00:00"))
+        out = tick.report(cj_, cfg(), NOW)
+        self.assertEqual((out["paid_today"], out["spent_usd"]), (2, 6.0))
+        self.assertEqual(out["est_profit_idr"], round(2 * review.profit_idr(order(), cfg())))
+
 
 class Mail(unittest.TestCase):
     def parse(self, *emails):
-        return mail.parse_decisions(list(emails), "owner@example.com", "abc.resend.app", mail.code)
+        return mail.parse_decisions(list(emails), "owner@example.com", "abc.resend.app")
+
+    def verdict(self, emails, oid, cost):
+        return mail.verdict(self.parse(*emails), oid, cost)
 
     def msg(self, to, sender="Owner <Owner@Example.com>", at="2026-11-15T10:00:00Z"):
         return {"from": sender, "to": [to], "created_at": at}
 
     def test_genuine_reply_counts(self):
-        self.assertEqual(self.parse(self.msg(mail.address("approve", "SD25ABC"))), {"sd25abc": "approve"})
+        reply = self.msg(mail.address("approve", "SD25ABC", 3.0))
+        self.assertEqual(self.verdict([reply], "SD25ABC", 3.0), "approve")
 
     def test_forgeries_are_ignored(self):
-        good = mail.address("approve", "SD25ABC")
-        self.assertEqual(self.parse(self.msg("approve-sd25abc-0000000000000000@abc.resend.app")), {})  # wrong code
-        self.assertEqual(self.parse(self.msg(good, sender="thief@example.com")), {})
-        self.assertEqual(self.parse(self.msg(good.replace("abc.resend.app", "evil.example"))), {})
-        other = mail.address("approve", "OTHER1").split("-")[2]  # a real code, for a different order
-        self.assertEqual(self.parse(self.msg(f"approve-sd25abc-{other}")), {})
+        good = mail.address("approve", "SD25ABC", 3.0)
+        self.assertIsNone(self.verdict([self.msg("approve-sd25abc-0000000000000000@abc.resend.app")], "SD25ABC", 3.0))
+        self.assertIsNone(self.verdict([self.msg(good, sender="thief@example.com")], "SD25ABC", 3.0))
+        self.assertIsNone(self.verdict([self.msg(good.replace("abc.resend.app", "evil.example"))], "SD25ABC", 3.0))
+        other = mail.address("approve", "OTHER1", 3.0).split("-")[2]  # a real code, for a different order
+        self.assertIsNone(self.verdict([self.msg(f"approve-sd25abc-{other}@abc.resend.app")], "SD25ABC", 3.0))
+
+    def test_approval_is_for_one_price(self):
+        reply = self.msg(mail.address("approve", "SD25ABC", 3.0))
+        self.assertEqual(self.verdict([reply], "SD25ABC", 3.004), "approve")  # same cents
+        self.assertIsNone(self.verdict([reply], "SD25ABC", 3.01))
 
     def test_latest_reply_wins(self):
-        a, r = mail.address("approve", "X1"), mail.address("reject", "X1")
-        self.assertEqual(self.parse(self.msg(r, at="2026-11-15T11:00:00Z"), self.msg(a, at="2026-11-15T10:00:00Z")), {"x1": "reject"})
+        a, r = mail.address("approve", "X1", 3.0), mail.address("reject", "X1", 3.0)
+        both = [self.msg(r, at="2026-11-15T11:00:00Z"), self.msg(a, at="2026-11-15T10:00:00Z")]
+        self.assertEqual(self.verdict(both, "X1", 3.0), "reject")
+
+    def test_review_email_key_changes_with_the_price(self):
+        keys = []
+        with mock.patch.object(mail, "_call", lambda method, path, body=None, key=None: keys.append(key)):
+            mail.ask("A1", 3.0, [], ["why"], "2026-11-15")
+            mail.ask("A1", 14.0, [], ["why"], "2026-11-15")
+        self.assertEqual(keys, ["review/A1/300/2026-11-15", "review/A1/1400/2026-11-15"])
+
+
+class Pay(unittest.TestCase):
+    """The real cj.pay, with CJ's answers scripted, since it is the only code that moves money."""
+
+    OK = {
+        "/shopping/order/addCart": {"interceptOrders": []},
+        "/shopping/order/addCartConfirm": {"shipmentsId": "S1"},
+        "/shopping/order/saveGenerateParentOrder": {"orderMoney": 4.0, "payId": "P1"},
+        "/shopping/pay/payBalanceV2": None,
+    }
+
+    def pay(self, status="CREATED", limit=5.0, **changes):
+        script, calls = self.OK | changes, []
+
+        def fake(method, path, params=None, body=None):
+            calls.append(path.rsplit("/", 1)[1])
+            return script[path]
+
+        with mock.patch.object(cj, "call", fake):
+            try:
+                return cj.pay("A1", status, limit), calls
+            except Blocked as e:
+                return e, calls
+
+    def test_happy_path_pays_the_quoted_amount(self):
+        result, calls = self.pay()
+        self.assertEqual((result, calls), (4.0, ["addCart", "addCartConfirm", "saveGenerateParentOrder", "payBalanceV2"]))
+
+    def test_order_already_in_cart_skips_add_cart(self):
+        self.assertNotIn("addCart", self.pay(status="IN_CART")[1])
+
+    def test_quote_above_the_reviewed_amount_pays_nothing(self):
+        result, calls = self.pay(limit=3.99)
+        self.assertIsInstance(result, Blocked)
+        self.assertNotIn("payBalanceV2", calls)
+
+    def test_each_cj_refusal_stops_before_payment(self):
+        blocked = {"interceptOrders": [{"interceptReason": [{"simpleTip": "Product removed."}]}]}
+        for changes in (
+            {"/shopping/order/addCart": blocked},
+            {"/shopping/order/addCartConfirm": blocked},  # no shipmentsId
+            {"/shopping/order/saveGenerateParentOrder": {"orderMoney": 4.0}},  # no payId
+            {"/shopping/order/saveGenerateParentOrder": {"payId": "P1", "orderMoney": 0}},
+        ):
+            result, calls = self.pay(**changes)
+            self.assertIsInstance(result, Blocked, changes)
+            self.assertNotIn("payBalanceV2", calls, changes)
+
+
+class Client(unittest.TestCase):
+    def tearDown(self):
+        cj._token, cj._last_call = None, 0.0
+
+    def test_token_is_fetched_before_the_wait_so_the_two_requests_are_spaced(self):
+        events = []
+
+        class Resp(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                pass
+
+        def urlopen(req, timeout=0):
+            events.append(req.full_url.rsplit("/", 1)[1])
+            return Resp(json.dumps({"code": 200, "data": {"accessToken": "t", "amount": 1}}).encode())
+
+        cj._token, cj._last_call = None, 0.0
+        with mock.patch.object(cj.time, "sleep", lambda s: events.append("wait")), mock.patch.object(cj.urllib.request, "urlopen", urlopen):
+            cj.balance()
+        self.assertEqual(events, ["wait", "getAccessToken", "wait", "getBalance"])
 
 
 class Scout(unittest.TestCase):

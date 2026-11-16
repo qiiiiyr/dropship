@@ -37,7 +37,9 @@ def _call(method, path, body=None, key=None):
             return json.load(resp)
     except urllib.error.HTTPError as e:
         if e.code == 409 and key:
-            return None  # this key was already used in the last 24 h: the email is already out
+            # Same key used in the last 24 h (Resend also answers 409 if the body changed): an
+            # email under this key is already out, so whatever must trigger a new one belongs in the key.
+            return None
         raise MailError(f"{path}: HTTP {e.code} {e.read()[:300]!r}") from None
 
 
@@ -54,20 +56,22 @@ def send(subject, text, html_body=None, key=None):
     return _call("POST", "/emails", body, key)
 
 
-def code(order_id):
+def code(order_id, cost_usd):
+    """Signs the order id AND its cost in cents, so an approval dies if CJ re-prices the order."""
     secret = os.environ["APPROVAL_SECRET"].encode()
-    return hmac.new(secret, order_id.lower().encode(), hashlib.sha256).hexdigest()[:16]
+    msg = f"{order_id.lower()}:{round(cost_usd * 100)}".encode()
+    return hmac.new(secret, msg, hashlib.sha256).hexdigest()[:16]
 
 
-def address(verb, order_id):
-    return f"{verb}-{order_id.lower()}-{code(order_id)}@{os.environ['RESEND_INBOUND']}"
+def address(verb, order_id, cost_usd):
+    return f"{verb}-{order_id.lower()}-{code(order_id, cost_usd)}@{os.environ['RESEND_INBOUND']}"
 
 
-def parse_decisions(emails, owner, inbound, code_for):
-    """{order id (lowercase): "approve" | "reject"} from received mail; the latest reply wins.
+def parse_decisions(emails, owner, inbound):
+    """{order id (lowercase): (verb, code)} from the owner's received mail; the latest reply wins.
 
-    The code in the address is what proves the reply is genuine: it only ever
-    appears in mail sent to the owner. The sender check is a second, weaker filter.
+    The sender check is a weak filter (From can be forged); verdict() checks the code,
+    which only ever appears in mail sent to the owner.
     """
     out = {}
     for mail in sorted(emails, key=lambda m: m.get("created_at") or ""):
@@ -75,20 +79,26 @@ def parse_decisions(emails, owner, inbound, code_for):
             continue
         for to in mail.get("to") or []:
             m = DECISION.match(email.utils.parseaddr(to)[1].lower())
-            if m and m[4] == inbound.lower() and hmac.compare_digest(m[3], code_for(m[2])):
-                out[m[2]] = m[1]
+            if m and m[4] == inbound.lower():
+                out[m[2]] = (m[1], m[3])
     return out
+
+
+def verdict(decisions, order_id, cost_usd):
+    """"approve", "reject" or None. None when there is no reply or it was for another price."""
+    got = decisions.get(order_id.lower())
+    return got[0] if got and hmac.compare_digest(got[1], code(order_id, cost_usd)) else None
 
 
 def decisions():
     # shortcut: looks at the latest 100 inbound emails, page further if replies ever outnumber that
     data = _call("GET", "/emails/receiving?limit=100") or {}
-    return parse_decisions(data.get("data") or [], os.environ["OWNER_EMAIL"], os.environ["RESEND_INBOUND"], code)
+    return parse_decisions(data.get("data") or [], os.environ["OWNER_EMAIL"], os.environ["RESEND_INBOUND"])
 
 
 def ask(order_id, cost_usd, facts, reasons, today):
     """Ask the owner to approve or reject one held order. One email per order per day."""
-    links = {verb: address(verb, order_id) for verb in ("approve", "reject")}
+    links = {verb: address(verb, order_id, cost_usd) for verb in ("approve", "reject")}
     text = "\n".join(
         [f"Order {order_id} is waiting for you. Cost at CJ: ${cost_usd:.2f}", "", "Why it is held:"]
         + [f"- {r}" for r in reasons]
@@ -106,4 +116,4 @@ def ask(order_id, cost_usd, facts, reasons, today):
         + button.format(to=links["reject"], verb="reject", oid=esc(order_id), bg="#b91c1c", label="Reject")
         + "</p><p>Tap a button, then press send on the email that opens. Nothing happens until you do.</p>"
     )
-    return send(f"[dropship] Approve order {order_id}? ${cost_usd:.2f}", text, html_body, key=f"review/{order_id}/{today}")
+    return send(f"[dropship] Approve order {order_id}? ${cost_usd:.2f}", text, html_body, key=f"review/{order_id}/{round(cost_usd * 100)}/{today}")

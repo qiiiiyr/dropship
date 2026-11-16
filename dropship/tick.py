@@ -12,8 +12,17 @@ OPEN = ("CREATED", "IN_CART", "UNPAID")
 FMT = "%Y-%m-%d %H:%M:%S"
 
 
+PAID = ("UNSHIPPED", "SHIPPED", "DELIVERED")
+
+
+def _paid(cj, since, now, **kw):
+    # Status is explicit: CJ's docs say an omitted status means CANCELLED, which a payment-date filter rejects.
+    pages = [cj.orders(status=s, paymentDateFrom=since.strftime(FMT), paymentDateTo=now.strftime(FMT), **kw) for s in PAID]
+    return {"total": sum(p["total"] for p in pages), "list": [o for p in pages for o in p["list"]]}
+
+
 def _paid_today(cj, now):
-    return cj.orders(paymentDateFrom=now.strftime("%Y-%m-%d 00:00:00"), paymentDateTo=now.strftime(FMT))["list"]
+    return _paid(cj, now.replace(hour=0, minute=0, second=0, microsecond=0), now)["list"]
 
 
 def _facts(order, cfg):
@@ -38,9 +47,13 @@ def run(cj, mail, cfg, now=None):
     balance = cj.balance()
     paid_today = _paid_today(cj, now)
     spent = sum(float(o.get("orderAmount") or 0) for o in paid_today)
-    paid_90d = cj.orders(paymentDateFrom=(now - timedelta(days=89)).strftime(FMT), paymentDateTo=now.strftime(FMT), pageSize=1)["total"]
+    paid_90d = _paid(cj, now - timedelta(days=89), now, pageSize=1)["total"]
     open_orders = [o for status in OPEN for o in cj.orders(status=status)["list"]]
-    decisions = mail.decisions() if open_orders else {}
+    try:
+        decisions = mail.decisions() if open_orders else {}
+    except Exception as e:  # a mail outage must not stop orders that need no approval
+        decisions = {}
+        out["errors"].append({"order": "-", "error": f"cannot read approvals, held orders will wait: {type(e).__name__}: {e}"})
     per_phone = Counter(o.get("shippingPhone") for o in open_orders + paid_today)
 
     for summary in open_orders:
@@ -51,7 +64,7 @@ def run(cj, mail, cfg, now=None):
                 out["waiting"].append(oid)  # CJ has not priced it yet
                 continue
             cost = float(order["orderAmount"])
-            verdict = decisions.get(oid.lower())
+            verdict = mail.verdict(decisions, oid, cost)
             if verdict == "reject":
                 out["rejected"].append(oid)
                 continue
@@ -92,11 +105,7 @@ def report(cj, cfg, now=None):
     """Numbers for the daily email."""
     now = now or datetime.now(timezone.utc)
     paid = [cj.order(o["orderId"]) for o in _paid_today(cj, now)]
-    profit = sum(
-        review.revenue_idr(o, cfg) * (1 - cfg["platform_fee_pct"] / 100) - float(o.get("orderAmount") or 0) * cfg["usd_idr"]
-        for o in paid
-        if review.margin_pct(o, cfg) is not None
-    )
+    profit = sum(review.profit_idr(o, cfg) for o in paid if review.margin_pct(o, cfg) is not None)
     late = (now - timedelta(days=2)).strftime(FMT)
     return {
         "date": now.strftime("%Y-%m-%d"),

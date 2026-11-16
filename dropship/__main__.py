@@ -12,7 +12,7 @@ ENV = ("CJ_API_KEY", "OWNER_EMAIL", "RESEND_INBOUND", "APPROVAL_SECRET")
 
 
 def scrub(x):
-    """Everything printed here is read by an agent, so free text is defanged first."""
+    """Everything printed here is read by an agent, so markup is stripped from free text first."""
     if isinstance(x, str):
         return clean(x)
     if isinstance(x, list):
